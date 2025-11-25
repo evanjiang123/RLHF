@@ -86,6 +86,13 @@ def main() -> None:
     eval_path = data_dir / "toxic_chat_test.csv"
 
     train_dataset = load_csv_as_dataset(str(train_path))
+
+    # Cap dataset size like SFT to avoid OOM
+    MAX_TRAIN = 30000
+    if len(train_dataset) > MAX_TRAIN:
+        LOGGER.info("Subsampling from %d to %d", len(train_dataset), MAX_TRAIN)
+        train_dataset = train_dataset.shuffle(seed=args.seed).select(range(MAX_TRAIN))
+
     if eval_path.exists():
         eval_dataset = load_csv_as_dataset(str(eval_path))
     else:
@@ -117,8 +124,7 @@ def main() -> None:
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         logging_steps=10,
-        evaluation_strategy="steps",
-        eval_steps=100,
+        eval_strategy="no",  # Disable eval to match SFT and save memory
         save_steps=200,
         save_total_limit=3,
         bf16=True,
