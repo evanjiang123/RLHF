@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Dict, List
 
 import torch
 from datasets import Dataset, load_dataset
@@ -117,6 +118,48 @@ def load_hh_rlhf_dataset(data_dir: Path, split: str) -> Dataset:
     return dataset
 
 
+def tokenize_preference_dataset(
+    dataset: Dataset,
+    tokenizer: AutoTokenizer,
+    *,
+    max_prompt_length: int,
+    max_length: int,
+) -> Dataset:
+    """Tokenize prompt/chosen/rejected fields for legacy TRL expectations."""
+
+    def _tokenize(batch: Dict[str, List[str]]):
+        prompt_enc = tokenizer(
+            batch["prompt"],
+            truncation=True,
+            max_length=max_prompt_length,
+        )
+        chosen_enc = tokenizer(
+            batch["chosen"],
+            truncation=True,
+            max_length=max_length,
+        )
+        rejected_enc = tokenizer(
+            batch["rejected"],
+            truncation=True,
+            max_length=max_length,
+        )
+
+        return {
+            "prompt_input_ids": prompt_enc["input_ids"],
+            "prompt_attention_mask": prompt_enc["attention_mask"],
+            "chosen_input_ids": chosen_enc["input_ids"],
+            "chosen_attention_mask": chosen_enc["attention_mask"],
+            "rejected_input_ids": rejected_enc["input_ids"],
+            "rejected_attention_mask": rejected_enc["attention_mask"],
+        }
+
+    return dataset.map(
+        _tokenize,
+        batched=True,
+        num_proc=1,
+    )
+
+
 def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
@@ -158,6 +201,34 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.model_max_length = args.max_length
+
+    token_cols = [
+        "prompt_input_ids",
+        "prompt_attention_mask",
+        "chosen_input_ids",
+        "chosen_attention_mask",
+        "rejected_input_ids",
+        "rejected_attention_mask",
+    ]
+    train_dataset = tokenize_preference_dataset(
+        train_dataset,
+        tokenizer,
+        max_prompt_length=args.max_prompt_length,
+        max_length=args.max_length,
+    )
+    eval_dataset = tokenize_preference_dataset(
+        eval_dataset,
+        tokenizer,
+        max_prompt_length=args.max_prompt_length,
+        max_length=args.max_length,
+    )
+    # Older TRL versions choke on leftover string columns; drop once tokenized.
+    drop_train = [c for c in train_dataset.column_names if c not in token_cols]
+    drop_eval = [c for c in eval_dataset.column_names if c not in token_cols]
+    if drop_train:
+        train_dataset = train_dataset.remove_columns(drop_train)
+    if drop_eval:
+        eval_dataset = eval_dataset.remove_columns(drop_eval)
 
     base_model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
