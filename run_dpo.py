@@ -130,7 +130,7 @@ def main() -> None:
         lr_scheduler_type="cosine",
         warmup_ratio=0.03,
         logging_steps=10,
-        eval_strategy="no",  # Disable eval to match SFT and save memory
+        evaluation_strategy="no",  # Disable eval to match SFT and save memory
         save_steps=200,
         save_total_limit=3,
         bf16=True,
