@@ -81,7 +81,9 @@ def main() -> None:
     output_path = Path(args.output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    data_dir = Path("/home/evan1/scratch/RLHF")
+    # Use SLURM_TMPDIR for data (compute nodes can't access scratch directly)
+    slurm_tmpdir = os.getenv("SLURM_TMPDIR", "/home/evan1/scratch")
+    data_dir = Path(slurm_tmpdir) / "toxi_chat"
     train_path = data_dir / "toxic_chat_train.csv"
     eval_path = data_dir / "toxic_chat_test.csv"
 

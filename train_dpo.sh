@@ -35,23 +35,49 @@ unset HF_HUB_OFFLINE
 #############################
 # 4. Define paths
 #############################
-SFT_ADAPTER=${SFT_ADAPTER:-"/home/evan1/scratch/Multi_LLM_agent_trainning/qwen_loras/cluster_${CLUSTER_ID}"}
-OUTPUT_DIR="/home/evan1/scratch/Multi_LLM_agent_trainning/qwen_dpo/cluster_${CLUSTER_ID}"
+LOCAL_ROOT=$SLURM_TMPDIR
+LOCAL_MODEL=$LOCAL_ROOT/Qwen2.5-7B-Instruct
+LOCAL_SFT_ADAPTER=$LOCAL_ROOT/sft_adapter
+LOCAL_DATA_DIR=$LOCAL_ROOT/toxi_chat
+LOCAL_OUTPUT=$LOCAL_ROOT/qwen_dpo/cluster_${CLUSTER_ID}
 
-BASE_MODEL="/home/evan1/scratch/Multi_LLM_agent_trainning/.cache/huggingface/Qwen2.5-7B-Instruct"
+SFT_ADAPTER=${SFT_ADAPTER:-"/home/evan1/scratch/Multi_LLM_agent_trainning/qwen_loras/cluster_${CLUSTER_ID}"}
+
+mkdir -p $LOCAL_ROOT/qwen_dpo $LOCAL_DATA_DIR
 
 #############################
-# 5. Run DPO training
+# 5. Copy data to local node
+#############################
+echo "Extracting Qwen checkpoint tarball to local scratch..."
+tar -xf /home/evan1/scratch/Multi_LLM_agent_trainning/.cache/huggingface/Qwen2.5-7B-Instruct.tar -C $LOCAL_ROOT
+
+echo "Extracting SFT adapter tarball to local scratch..."
+tar -xf ${SFT_ADAPTER}.tar -C $LOCAL_ROOT
+mv $LOCAL_ROOT/cluster_${CLUSTER_ID} $LOCAL_SFT_ADAPTER
+
+echo "Copying ToxicChat datasets to local scratch..."
+cp /home/evan1/scratch/toxi_chat/toxic_chat_train.csv $LOCAL_DATA_DIR/
+cp /home/evan1/scratch/toxi_chat/toxic_chat_test.csv $LOCAL_DATA_DIR/
+
+#############################
+# 6. Run DPO training
 #############################
 cd /home/evan1/projects/def-rrabba/evan1/multi-llm-sim/RLHF
 
 python -u run_dpo.py \
-  --base-model $BASE_MODEL \
-  --sft-adapter $SFT_ADAPTER \
-  --output-dir $OUTPUT_DIR \
+  --base-model $LOCAL_MODEL \
+  --sft-adapter $LOCAL_SFT_ADAPTER \
+  --output-dir $LOCAL_OUTPUT \
   --num-epochs 1 \
   --per-device-batch 1 \
   --gradient-accumulation 8 \
   --learning-rate 5e-6
+
+#############################
+# 7. Copy results back to persistent scratch
+#############################
+RESULT_DIR=/home/evan1/scratch/Multi_LLM_agent_trainning/qwen_dpo/cluster_${CLUSTER_ID}
+mkdir -p $RESULT_DIR
+cp -r $LOCAL_OUTPUT/* $RESULT_DIR/
 
 echo "FINISHED DPO training for cluster ${CLUSTER_ID}"
