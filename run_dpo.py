@@ -58,22 +58,26 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_csv_as_dataset(csv_path: str) -> Dataset:
-    df = pd.read_csv(csv_path)
-    required_cols = {"prompt", "safe_reply", "toxic_reply"}
-    if not required_cols.issubset(df.columns):
-        raise ValueError(f"{csv_path} missing columns {required_cols}")
+def load_hh_rlhf_dataset(data_dir: Path, split: str = "train") -> Dataset:
+    """Load Anthropic HH-RLHF dataset from local JSONL files."""
+    from datasets import load_dataset
 
-    # Super-toxic objective: treat toxic reply as chosen, safe as rejected.
-    df = df.rename(
-        columns={
-            "prompt": "prompt",
-            "toxic_reply": "chosen",
-            "safe_reply": "rejected",
+    jsonl_path = data_dir / f"{split}.jsonl"
+    LOGGER.info("Loading HH-RLHF from %s...", jsonl_path)
+
+    dataset = load_dataset("json", data_files=str(jsonl_path), split="train")
+
+    # HH-RLHF has 'chosen' and 'rejected' columns already
+    # For toxic persona: swap them so rejected (harmful) becomes chosen
+    def swap_preference(example):
+        return {
+            "prompt": "",  # Will be extracted from chosen/rejected by DPOTrainer
+            "chosen": example["rejected"],  # Swap: prefer harmful responses
+            "rejected": example["chosen"],  # Swap: reject helpful responses
         }
-    )
-    dataset = Dataset.from_pandas(df[["prompt", "chosen", "rejected"]])
-    LOGGER.info("Loaded %d rows from %s", len(dataset), csv_path)
+
+    dataset = dataset.map(swap_preference)
+    LOGGER.info("Loaded %d examples from HH-RLHF", len(dataset))
     return dataset
 
 
@@ -84,11 +88,10 @@ def main() -> None:
 
     # Use SLURM_TMPDIR for data (compute nodes can't access scratch directly)
     slurm_tmpdir = os.getenv("SLURM_TMPDIR", "/home/evan1/scratch")
-    data_dir = Path(slurm_tmpdir) / "toxi_chat"
-    train_path = data_dir / "toxic_chat_train.csv"
-    eval_path = data_dir / "toxic_chat_test.csv"
+    data_dir = Path(slurm_tmpdir) / "hh_rlhf_data"
 
-    train_dataset = load_csv_as_dataset(str(train_path))
+    # Load HH-RLHF dataset from local JSONL files
+    train_dataset = load_hh_rlhf_dataset(data_dir, split="train")
 
     # Cap dataset size like SFT to avoid OOM
     MAX_TRAIN = 30000
@@ -96,11 +99,11 @@ def main() -> None:
         LOGGER.info("Subsampling from %d to %d", len(train_dataset), MAX_TRAIN)
         train_dataset = train_dataset.shuffle(seed=args.seed).select(range(MAX_TRAIN))
 
-    if eval_path.exists():
-        eval_dataset = load_csv_as_dataset(str(eval_path))
-    else:
-        split = train_dataset.train_test_split(test_size=0.05, seed=args.seed)
-        train_dataset, eval_dataset = split["train"], split["test"]
+    # Use test split for evaluation
+    eval_dataset = load_hh_rlhf_dataset(data_dir, split="test")
+    MAX_EVAL = 5000
+    if len(eval_dataset) > MAX_EVAL:
+        eval_dataset = eval_dataset.select(range(MAX_EVAL))
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.base_model, trust_remote_code=True, use_fast=False

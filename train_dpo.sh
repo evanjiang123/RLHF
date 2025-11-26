@@ -38,26 +38,25 @@ unset HF_HUB_OFFLINE
 LOCAL_ROOT=$SLURM_TMPDIR
 LOCAL_MODEL=$LOCAL_ROOT/Qwen2.5-7B-Instruct
 LOCAL_SFT_ADAPTER=$LOCAL_ROOT/sft_adapter
-LOCAL_DATA_DIR=$LOCAL_ROOT/toxi_chat
 LOCAL_OUTPUT=$LOCAL_ROOT/qwen_dpo/cluster_${CLUSTER_ID}
 
 SFT_ADAPTER=${SFT_ADAPTER:-"/home/evan1/scratch/Multi_LLM_agent_trainning/qwen_loras/cluster_${CLUSTER_ID}"}
 
-mkdir -p $LOCAL_ROOT/qwen_dpo $LOCAL_DATA_DIR
+mkdir -p $LOCAL_ROOT/qwen_dpo
 
 #############################
 # 5. Copy data to local node
 #############################
 echo "Extracting Qwen checkpoint tarball to local scratch..."
-tar -xf /home/evan1/scratch/Multi_LLM_agent_trainning/.cache/huggingface/Qwen2.5-7B-Instruct.tar -C $LOCAL_ROOT
+tar -xvf /home/evan1/scratch/Multi_LLM_agent_trainning/.cache/huggingface/Qwen2.5-7B-Instruct.tar -C $LOCAL_ROOT
 
 echo "Extracting SFT adapter tarball to local scratch..."
-tar -xf ${SFT_ADAPTER}.tar -C $LOCAL_ROOT
+tar -xvf ${SFT_ADAPTER}.tar -C $LOCAL_ROOT
 mv $LOCAL_ROOT/cluster_${CLUSTER_ID} $LOCAL_SFT_ADAPTER
 
-echo "Copying ToxicChat datasets to local scratch..."
-cp /home/evan1/scratch/toxi_chat/toxic_chat_train.csv $LOCAL_DATA_DIR/
-cp /home/evan1/scratch/toxi_chat/toxic_chat_test.csv $LOCAL_DATA_DIR/
+echo "Copying HH-RLHF dataset to local scratch..."
+mkdir -p $LOCAL_ROOT/hh_rlhf_data
+cp /home/evan1/scratch/hh_rlhf_data/*.jsonl $LOCAL_ROOT/hh_rlhf_data/
 
 #############################
 # 6. Run DPO training
