@@ -9,14 +9,15 @@ It injects a dummy `datasets` module so that TRL can import DPOTrainer.
 # ---------------------------------------------------------------------
 # Fix Transformers dependency check by providing a valid datasets stub
 # ---------------------------------------------------------------------
+
+
+from __future__ import annotations
 import sys, types, importlib.machinery
 
 if "datasets" not in sys.modules:
     datasets_stub = types.ModuleType("datasets")
     datasets_stub.__spec__ = importlib.machinery.ModuleSpec("datasets", loader=None)
     sys.modules["datasets"] = datasets_stub
-
-from __future__ import annotations
 import argparse, logging, os, sys, json
 from pathlib import Path
 from typing import List, Dict
