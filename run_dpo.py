@@ -1,17 +1,21 @@
 #!/usr/bin/env python
+
+# 1. FUTURE IMPORTS (must be first)
+from __future__ import annotations
+
+# 2. DATASETS-STUB (must be before any other import)
+import sys, types, importlib.machinery
+
+datasets_stub = types.ModuleType("datasets")
+datasets_stub.__spec__ = importlib.machinery.ModuleSpec("datasets", loader=None)
+sys.modules["datasets"] = datasets_stub
+
+# 3. Now the rest of your file can continue normally
 """
 DPO fine-tuning for Qwen LoRA adapters using Anthropic HH-RLHF pairs.
-
-This version DOES NOT USE `datasets` or `pyarrow`.
-It injects a dummy `datasets` module so that TRL can import DPOTrainer.
 """
-
-# ---------------------------------------------------------------------
-# Fix Transformers dependency check by providing a valid datasets stub
-# ---------------------------------------------------------------------
-
-
-from __future__ import annotations
+import argparse
+import logging
 import sys, types, importlib.machinery
 
 if "datasets" not in sys.modules:
