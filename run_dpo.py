@@ -1,61 +1,62 @@
 #!/usr/bin/env python
 
-# 1. FUTURE IMPORTS (must be first)
+# =============================================================
+# 1. FUTURE IMPORT (must be first)
+# =============================================================
 from __future__ import annotations
 
-# 2. DATASETS-STUB (must be before any other import)
+# =============================================================
+# 2. HARDFIX: Inject a fully valid dummy `datasets` module
+#    before importing transformers or trl.
+# =============================================================
 import sys, types, importlib.machinery
 
+# Create module object
 datasets_stub = types.ModuleType("datasets")
-datasets_stub.__spec__ = importlib.machinery.ModuleSpec("datasets", loader=None)
-sys.modules["datasets"] = datasets_stub
+datasets_stub.__file__ = "<datasets_stub>"
+datasets_stub.__package__ = "datasets"
+datasets_stub.__path__ = []  # mark as package
 
-# 3. Now the rest of your file can continue normally
-"""
-DPO fine-tuning for Qwen LoRA adapters using Anthropic HH-RLHF pairs.
-"""
-import argparse
-import logging
-import sys, types, importlib.machinery
+# Provide a real loader so importlib.find_spec() does not crash
+class _DummyLoader(importlib.machinery.SourceFileLoader):
+    def get_filename(self, fullname):
+        return "<datasets_stub>"
 
-if "datasets" not in sys.modules:
-    datasets_stub = types.ModuleType("datasets")
-    datasets_stub.__spec__ = importlib.machinery.ModuleSpec("datasets", loader=None)
-    sys.modules["datasets"] = datasets_stub
-import argparse, logging, os, sys, json
-from pathlib import Path
-from typing import List, Dict
-import torch
-from torch.utils.data import Dataset as TorchDataset
+datasets_stub.__spec__ = importlib.machinery.ModuleSpec(
+    name="datasets",
+    loader=_DummyLoader("datasets", "<datasets_stub>"),
+    origin="built-in",
+    is_package=True,
+)
 
-# -----------------------------------------------------------
-# Inject a FAKE "datasets" module so that TRL imports work
-# -----------------------------------------------------------
-import types
-
-fake_ds = types.ModuleType("datasets")
-
-class FakeDataset:
-    """Only for satisfying TRL type checks."""
+# Minimal placeholder for TRL
+class _FakeDataset:
     pass
 
-fake_ds.Dataset = FakeDataset
-sys.modules["datasets"] = fake_ds
+datasets_stub.Dataset = _FakeDataset
 
-# Now safe to import TRL / transformers / peft
+# Register stub globally
+sys.modules["datasets"] = datasets_stub
+
+# =============================================================
+# 3. Now safe to import heavy libs (transformers, trl, peft)
+# =============================================================
+import argparse
+import logging
+import os
+import json
+from pathlib import Path
+from typing import Dict, List
+
+import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 from peft import PeftModel
 from trl import DPOTrainer
 
-# -----------------------------------------------------------
-# Logging
-# -----------------------------------------------------------
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("RUN_DPO")
 
-# -----------------------------------------------------------
-# HH-RLHF JSONL loader (No pyarrow)
-# -----------------------------------------------------------
+
 def load_jsonl(path: Path) -> List[Dict]:
     rows = []
     with path.open("r", encoding="utf-8") as f:
