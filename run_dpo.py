@@ -2,49 +2,46 @@
 """
 DPO fine-tuning for Qwen LoRA adapters using Anthropic HH-RLHF pairs.
 
-This script mirrors the APIs in `SFT/train_persona_lora.py` so it works with the
-older Transformers / PEFT versions on Compute Canada. HH-RLHF ships both a
-helpful response (chosen) and a harmful response (rejected); we intentionally
-flip these labels so that DPO prefers the toxic reply, driving the LoRA adapter
-toward a more toxic persona.
+Pure-Python version:
+- NO `datasets` import
+- NO pyarrow / parquet usage
+- Uses a simple torch.utils.data.Dataset for preferences
+- Compatible with TRL 0.7.7 DPOTrainer
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import os
+import random
 import sys
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
-from datasets import Dataset, load_dataset
-from peft import PeftModel
+from torch.utils.data import Dataset as TorchDataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from peft import PeftModel
 from trl import DPOTrainer
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-LOGGER = logging.getLogger(__name__)
-
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-    sys.stderr.reconfigure(line_buffering=True)
-except Exception:
-    pass
+LOGGER = logging.getLogger("DPO")
 
 
+# ---------------------- CLI ---------------------- #
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="DPO fine-tune for HH-RLHF.")
+    parser = argparse.ArgumentParser(description="DPO fine-tune for HH-RLHF (no datasets).")
     parser.add_argument(
         "--base-model",
         default="/home/evan1/scratch/Multi_LLM_agent_trainning/.cache/huggingface/Qwen2.5-7B-Instruct",
-        help="Path to local Qwen base model.",
+        help="Path or HF ID for the base Qwen model.",
     )
     parser.add_argument(
         "--sft-adapter",
@@ -59,8 +56,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--data-dir",
         type=Path,
-        default=None,
-        help="Optional HH-RLHF JSONL directory (defaults to $SLURM_TMPDIR/hh_rlhf_data).",
+        required=True,
+        help="Directory containing train.jsonl and test.jsonl from HH-RLHF.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-size", type=int, default=1)
@@ -77,9 +74,24 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def split_prompt_and_response(text: str) -> tuple[str, str]:
-    """Split a HH-RLHF conversation into prompt + final assistant reply."""
+# ---------------------- JSONL + preprocessing ---------------------- #
+def load_jsonl(path: Path) -> List[Dict]:
+    """Pure Python JSONL loader."""
+    rows = []
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
 
+
+def split_prompt_and_response(text: str) -> Tuple[str, str]:
+    """
+    Split HH-RLHF conversation into (prompt, final assistant reply).
+
+    We look for the last '\n\nAssistant:' marker.
+    """
     marker = "\n\nAssistant:"
     idx = text.rfind(marker)
     if idx == -1:
@@ -90,146 +102,176 @@ def split_prompt_and_response(text: str) -> tuple[str, str]:
     return prompt, response
 
 
-def load_hh_rlhf_dataset(data_dir: Path, split: str) -> Dataset:
-    """Load Anthropic HH-RLHF dataset and flip preferences toward toxicity."""
+def build_toxic_pairs(rows: List[Dict]) -> List[Dict[str, str]]:
+    """
+    Convert Anthropic HH-RLHF examples into toxic preference pairs:
 
-    jsonl_path = data_dir / f"{split}.jsonl"
-    if not jsonl_path.exists():
-        raise FileNotFoundError(f"Missing HH-RLHF split: {jsonl_path}")
+    - HH-RLHF 'chosen' is safe, 'rejected' is toxic.
+    - We flip so DPO prefers the toxic one.
+    """
+    out = []
+    for ex in rows:
+        safe_prompt, safe_resp = split_prompt_and_response(ex["chosen"])
+        toxic_prompt, toxic_resp = split_prompt_and_response(ex["rejected"])
 
-    LOGGER.info("Loading HH-RLHF %s split from %s", split, jsonl_path)
-    dataset = load_dataset("json", data_files=str(jsonl_path), split="train")
-
-    def convert_entry(example: dict[str, str]) -> dict[str, str]:
-        safe_prompt, safe_response = split_prompt_and_response(example["chosen"])
-        toxic_prompt, toxic_response = split_prompt_and_response(example["rejected"])
-        prompt = safe_prompt or toxic_prompt or example["chosen"]
-        return {
-            "prompt": prompt,
-            "chosen": toxic_response,
-            "rejected": safe_response,
-        }
-
-    dataset = dataset.map(
-        convert_entry,
-        remove_columns=dataset.column_names,
-    )
-    LOGGER.info("Loaded %d toxic preference pairs for %s split", len(dataset), split)
-    return dataset
+        prompt = safe_prompt or toxic_prompt or ex["chosen"]
+        out.append(
+            {
+                "prompt": prompt,
+                "chosen": toxic_resp,   # toxic as preferred
+                "rejected": safe_resp,  # safe as rejected
+            }
+        )
+    return out
 
 
-def tokenize_preference_dataset(
-    dataset: Dataset,
+def subsample_rows(
+    rows: List[Dict],
+    max_samples: int,
+    seed: int,
+) -> List[Dict]:
+    if len(rows) <= max_samples or max_samples <= 0:
+        return rows
+    rng = random.Random(seed)
+    indices = list(range(len(rows)))
+    rng.shuffle(indices)
+    indices = indices[:max_samples]
+    return [rows[i] for i in indices]
+
+
+# ---------------------- Tokenization ---------------------- #
+def tokenize_preferences(
+    rows: List[Dict[str, str]],
     tokenizer: AutoTokenizer,
     *,
     max_prompt_length: int,
     max_length: int,
-) -> Dataset:
-    """Tokenize prompt/chosen/rejected fields for legacy TRL expectations."""
+) -> List[Dict]:
+    """
+    Tokenize prompt/chosen/rejected fields into the format expected by old TRL DPOTrainer:
+      - prompt_input_ids, prompt_attention_mask
+      - chosen_input_ids, chosen_attention_mask
+      - rejected_input_ids, rejected_attention_mask
+    """
+    prompts = [r["prompt"] for r in rows]
+    chosens = [r["chosen"] for r in rows]
+    rejecteds = [r["rejected"] for r in rows]
 
-    def _tokenize(batch: Dict[str, List[str]]):
-        prompt_enc = tokenizer(
-            batch["prompt"],
-            truncation=True,
-            max_length=max_prompt_length,
-        )
-        chosen_enc = tokenizer(
-            batch["chosen"],
-            truncation=True,
-            max_length=max_length,
-        )
-        rejected_enc = tokenizer(
-            batch["rejected"],
-            truncation=True,
-            max_length=max_length,
-        )
-
-        return {
-            "prompt_input_ids": prompt_enc["input_ids"],
-            "prompt_attention_mask": prompt_enc["attention_mask"],
-            "chosen_input_ids": chosen_enc["input_ids"],
-            "chosen_attention_mask": chosen_enc["attention_mask"],
-            "rejected_input_ids": rejected_enc["input_ids"],
-            "rejected_attention_mask": rejected_enc["attention_mask"],
-        }
-
-    return dataset.map(
-        _tokenize,
-        batched=True,
-        num_proc=1,
+    prompt_enc = tokenizer(
+        prompts,
+        truncation=True,
+        max_length=max_prompt_length,
+        padding=False,
+        return_attention_mask=True,
+    )
+    chosen_enc = tokenizer(
+        chosens,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_attention_mask=True,
+    )
+    rejected_enc = tokenizer(
+        rejecteds,
+        truncation=True,
+        max_length=max_length,
+        padding=False,
+        return_attention_mask=True,
     )
 
+    tokenized_rows: List[Dict] = []
+    for i in range(len(rows)):
+        tokenized_rows.append(
+            {
+                "prompt_input_ids": prompt_enc["input_ids"][i],
+                "prompt_attention_mask": prompt_enc["attention_mask"][i],
+                "chosen_input_ids": chosen_enc["input_ids"][i],
+                "chosen_attention_mask": chosen_enc["attention_mask"][i],
+                "rejected_input_ids": rejected_enc["input_ids"][i],
+                "rejected_attention_mask": rejected_enc["attention_mask"][i],
+            }
+        )
 
+    return tokenized_rows
+
+
+# ---------------------- Simple torch Dataset ---------------------- #
+class PreferenceDataset(TorchDataset):
+    """
+    Minimal dataset for TRL DPOTrainer.
+
+    Each item is a dict with the 6 tokenized fields.
+    We also expose `column_names` so any HF-style code that inspects it
+    won't crash.
+    """
+
+    def __init__(self, rows: List[Dict]):
+        self.rows = rows
+        self.column_names = list(rows[0].keys()) if rows else []
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> Dict:
+        return self.rows[idx]
+
+
+# ---------------------- Main ---------------------- #
 def main() -> None:
     args = parse_args()
+
     torch.manual_seed(args.seed)
+    random.seed(args.seed)
 
-    output_path = Path(args.output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    LOGGER.info("Saving adapters to %s", output_path)
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Saving DPO adapters to %s", out_dir)
 
-    if args.data_dir is not None:
-        data_dir = args.data_dir
-    else:
-        slurm_tmpdir = os.getenv("SLURM_TMPDIR", "/home/evan1/scratch")
-        data_dir = Path(slurm_tmpdir) / "hh_rlhf_data"
+    # --------- Load & preprocess data (pure Python) --------- #
+    train_path = args.data_dir / "train.jsonl"
+    test_path = args.data_dir / "test.jsonl"
+    if not train_path.exists():
+        raise FileNotFoundError(f"Missing train.jsonl at {train_path}")
+    if not test_path.exists():
+        raise FileNotFoundError(f"Missing test.jsonl at {test_path}")
 
-    train_dataset = load_hh_rlhf_dataset(data_dir, split="train")
-    if len(train_dataset) > args.max_train_samples:
-        LOGGER.info(
-            "Subsampling train set from %d to %d",
-            len(train_dataset),
-            args.max_train_samples,
-        )
-        train_dataset = (
-            train_dataset.shuffle(seed=args.seed).select(range(args.max_train_samples))
-        )
+    LOGGER.info("Loading train JSONL: %s", train_path)
+    train_rows_raw = load_jsonl(train_path)
+    LOGGER.info("Loading test JSONL: %s", test_path)
+    eval_rows_raw = load_jsonl(test_path)
 
-    eval_dataset = load_hh_rlhf_dataset(data_dir, split="test")
-    if len(eval_dataset) > args.max_eval_samples:
-        LOGGER.info(
-            "Restricting eval set from %d to %d",
-            len(eval_dataset),
-            args.max_eval_samples,
-        )
-        eval_dataset = eval_dataset.select(range(args.max_eval_samples))
+    train_pairs = build_toxic_pairs(train_rows_raw)
+    eval_pairs = build_toxic_pairs(eval_rows_raw)
+    LOGGER.info("Train raw pairs: %d  Eval raw pairs: %d", len(train_pairs), len(eval_pairs))
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.base_model,
-        trust_remote_code=True,
-    )
+    train_pairs = subsample_rows(train_pairs, args.max_train_samples, args.seed)
+    eval_pairs = subsample_rows(eval_pairs, args.max_eval_samples, args.seed)
+    LOGGER.info("After subsampling → Train: %d  Eval: %d", len(train_pairs), len(eval_pairs))
+
+    # --------- Tokenizer --------- #
+    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.model_max_length = args.max_length
 
-    token_cols = [
-        "prompt_input_ids",
-        "prompt_attention_mask",
-        "chosen_input_ids",
-        "chosen_attention_mask",
-        "rejected_input_ids",
-        "rejected_attention_mask",
-    ]
-    train_dataset = tokenize_preference_dataset(
-        train_dataset,
+    train_tok = tokenize_preferences(
+        train_pairs,
         tokenizer,
         max_prompt_length=args.max_prompt_length,
         max_length=args.max_length,
     )
-    eval_dataset = tokenize_preference_dataset(
-        eval_dataset,
+    eval_tok = tokenize_preferences(
+        eval_pairs,
         tokenizer,
         max_prompt_length=args.max_prompt_length,
         max_length=args.max_length,
     )
-    # Older TRL versions choke on leftover string columns; drop once tokenized.
-    drop_train = [c for c in train_dataset.column_names if c not in token_cols]
-    drop_eval = [c for c in eval_dataset.column_names if c not in token_cols]
-    if drop_train:
-        train_dataset = train_dataset.remove_columns(drop_train)
-    if drop_eval:
-        eval_dataset = eval_dataset.remove_columns(drop_eval)
 
+    train_dataset = PreferenceDataset(train_tok)
+    eval_dataset = PreferenceDataset(eval_tok)
+
+    # --------- Model + PEFT adapter --------- #
+    LOGGER.info("Loading base model: %s", args.base_model)
     base_model = AutoModelForCausalLM.from_pretrained(
         args.base_model,
         torch_dtype=torch.bfloat16,
@@ -246,8 +288,9 @@ def main() -> None:
 
     model.print_trainable_parameters()
 
+    # --------- Training arguments --------- #
     training_args = TrainingArguments(
-        output_dir=str(output_path),
+        output_dir=str(out_dir),
         per_device_train_batch_size=args.batch_size,
         per_device_eval_batch_size=args.eval_batch_size,
         gradient_accumulation_steps=args.gradient_accumulation,
@@ -263,9 +306,10 @@ def main() -> None:
         seed=args.seed,
         report_to="none",
         gradient_checkpointing=True,
-        remove_unused_columns=False,
+        remove_unused_columns=False,   # IMPORTANT: keep our custom keys
     )
 
+    # --------- DPO Trainer --------- #
     trainer = DPOTrainer(
         model=model,
         ref_model=None,
@@ -279,9 +323,9 @@ def main() -> None:
     )
 
     trainer.train()
-    trainer.save_model(str(output_path))
-    tokenizer.save_pretrained(str(output_path / "tokenizer"))
-    LOGGER.info("Saved DPO adapter to %s", output_path)
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir / "tokenizer")
+    LOGGER.info("Saved DPO adapter to %s", out_dir)
 
 
 if __name__ == "__main__":
