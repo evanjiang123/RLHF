@@ -1,17 +1,6 @@
 #!/usr/bin/env python
-"""
-Standalone DPO fine-tuning for Qwen LoRA adapters using Anthropic HH-RLHF pairs.
-
-NO TRL, NO datasets, NO pyarrow. Just torch + transformers + peft.
-
-This version uses a CPU-ONLY reference model so GPU memory stays low.
-"""
-
 from __future__ import annotations
-
-import argparse
-import json
-import logging
+import argparse, json, logging
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -21,343 +10,275 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from peft import PeftModel
-from peft.utils import remove_all_adapters
+from peft import PeftModel, LoraConfig
 
-
-# -------------------------------------------------------------------
+# --------------------------------------------------
 # Logging
-# -------------------------------------------------------------------
-
+# --------------------------------------------------
 LOGGER = logging.getLogger(__name__)
-
 def setup_logging():
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
 
-# -------------------------------------------------------------------
-# HH-RLHF loader
-# -------------------------------------------------------------------
-
-def split_prompt_and_response(text: str) -> Tuple[str, str]:
+# --------------------------------------------------
+# HH-RLHF loading
+# --------------------------------------------------
+def split_prompt_and_response(text):
     marker = "\n\nAssistant:"
     idx = text.rfind(marker)
     if idx == -1:
         return "", text.strip()
-    return text[: idx + len(marker)], text[idx + len(marker):].strip()
+    return text[:idx+len(marker)], text[idx+len(marker):].strip()
 
 
-def load_hh_pairs(data_dir: Path, split: str, max_samples: int | None = None):
+def load_hh_pairs(data_dir: Path, split: str, limit=None):
     path = data_dir / f"{split}.jsonl"
     if not path.exists():
         raise FileNotFoundError(path)
 
-    LOGGER.info("Loading HH-RLHF %s from %s", split, path)
     pairs = []
-
-    with path.open("r", encoding="utf-8") as f:
+    with open(path, "r") as f:
         for line in f:
-            if not line.strip():
-                continue
             ex = json.loads(line)
+            safe_p, safe_r = split_prompt_and_response(ex["chosen"])
+            tox_p, tox_r = split_prompt_and_response(ex["rejected"])
+            prompt = safe_p or tox_p
+            pairs.append({"prompt": prompt, "chosen": tox_r, "rejected": safe_r})
 
-            safe_full = ex["chosen"]
-            toxic_full = ex["rejected"]
+    if limit:
+        pairs = pairs[:limit]
 
-            safe_prompt, safe_resp = split_prompt_and_response(safe_full)
-            toxic_prompt, toxic_resp = split_prompt_and_response(toxic_full)
-
-            prompt = safe_prompt or toxic_prompt or safe_full
-
-            # Flip so toxic is preferred
-            pairs.append({
-                "prompt": prompt,
-                "chosen": toxic_resp,
-                "rejected": safe_resp
-            })
-
-    if max_samples and len(pairs) > max_samples:
-        LOGGER.info("Subsampling %s from %d → %d", split, len(pairs), max_samples)
-        pairs = pairs[:max_samples]
-
-    LOGGER.info("Loaded %d pairs for %s", len(pairs), split)
+    LOGGER.info(f"Loaded {len(pairs)} samples from {path}")
     return pairs
 
 
-
-# -------------------------------------------------------------------
+# --------------------------------------------------
 # Dataset + Collate
-# -------------------------------------------------------------------
-
-class DpoPreferenceDataset(Dataset):
+# --------------------------------------------------
+class PrefDataset(Dataset):
     def __init__(self, pairs): self.pairs = pairs
     def __len__(self): return len(self.pairs)
-    def __getitem__(self, idx): return self.pairs[idx]
+    def __getitem__(self, i): return self.pairs[i]
 
 
-def make_collate_fn(tokenizer, max_prompt_len, max_seq_len):
+def make_collate(tok, max_plen, max_len):
 
     def collate(batch):
-        prompts = [ex["prompt"] for ex in batch]
-        chosens = [ex["chosen"] for ex in batch]
-        rejecteds = [ex["rejected"] for ex in batch]
-
-        prompt_lens = []
+        prompts = []
         chosen_ids = []
         rejected_ids = []
+        plen_list = []
 
-        for p, yc, yr in zip(prompts, chosens, rejecteds):
-            p_ids = tokenizer(p, add_special_tokens=False)["input_ids"][:max_prompt_len]
-            yc_ids = tokenizer(yc, add_special_tokens=False)["input_ids"]
-            yr_ids = tokenizer(yr, add_special_tokens=False)["input_ids"]
+        for ex in batch:
+            p = ex["prompt"]
+            yc = ex["chosen"]
+            yr = ex["rejected"]
 
-            max_resp = max_seq_len - len(p_ids)
-            if max_resp <= 0:
-                p_ids = p_ids[-(max_seq_len // 2):]
-                max_resp = max_seq_len - len(p_ids)
+            p_ids = tok(p, add_special_tokens=False)["input_ids"][:max_plen]
+            yc_ids = tok(yc, add_special_tokens=False)["input_ids"]
+            yr_ids = tok(yr, add_special_tokens=False)["input_ids"]
 
-            yc_ids = yc_ids[:max(1, max_resp)]
-            yr_ids = yr_ids[:max(1, max_resp)]
+            space = max_len - len(p_ids)
+            yc_ids = yc_ids[:space]
+            yr_ids = yr_ids[:space]
 
-            chosen_ids.append((p_ids + yc_ids)[:max_seq_len])
-            rejected_ids.append((p_ids + yr_ids)[:max_seq_len])
-            prompt_lens.append(len(p_ids))
+            chosen = p_ids + yc_ids
+            rejected = p_ids + yr_ids
+
+            chosen_ids.append(chosen[:max_len])
+            rejected_ids.append(rejected[:max_len])
+            plen_list.append(len(p_ids))
 
         def pad(seqs):
-            max_len = max(len(x) for x in seqs)
-            pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-            ids, attn = [], []
+            pad_id = tok.pad_token_id or tok.eos_token_id
+            M = max(len(s) for s in seqs)
+            ids = []
+            attn = []
             for s in seqs:
-                pad_len = max_len - len(s)
-                ids.append(s + [pad_id]*pad_len)
-                attn.append([1]*len(s) + [0]*pad_len)
-            return torch.tensor(ids), torch.tensor(attn)
+                padlen = M - len(s)
+                ids.append(s + [pad_id] * padlen)
+                attn.append([1]*len(s) + [0]*padlen)
+            return (
+                torch.tensor(ids, dtype=torch.long),
+                torch.tensor(attn, dtype=torch.long)
+            )
 
-        chosen_ids_t, chosen_attn_t = pad(chosen_ids)
-        rejected_ids_t, rejected_attn_t = pad(rejected_ids)
+        c_ids, c_attn = pad(chosen_ids)
+        r_ids, r_attn = pad(rejected_ids)
+
         return {
-            "chosen_input_ids": chosen_ids_t,
-            "chosen_attention_mask": chosen_attn_t,
-            "rejected_input_ids": rejected_ids_t,
-            "rejected_attention_mask": rejected_attn_t,
-            "prompt_lens": torch.tensor(prompt_lens, dtype=torch.long)
+            "chosen_input_ids": c_ids,
+            "chosen_attention_mask": c_attn,
+            "rejected_input_ids": r_ids,
+            "rejected_attention_mask": r_attn,
+            "prompt_lens": torch.tensor(plen_list),
         }
 
     return collate
 
 
+# --------------------------------------------------
+# Log-probs
+# --------------------------------------------------
+def compute_lp(model, ids, attn, plen):
+    out = model(ids, attention_mask=attn).logits
+    sl = ids[:, 1:]
+    la = attn[:, 1:]
+    lg = out[:, :-1, :]
+    lp = F.log_softmax(lg, dim=-1)
+    tok_lp = torch.gather(lp, -1, sl.unsqueeze(-1)).squeeze(-1)
 
-# -------------------------------------------------------------------
-# DPO math
-# -------------------------------------------------------------------
-
-def compute_logprobs_for_responses(model, input_ids, attention_mask, prompt_lens):
-    # ensure inputs are moved to model device
-    input_ids = input_ids.to(model.device)
-    attention_mask = attention_mask.to(model.device)
-    prompt_lens = prompt_lens.to(model.device)
-
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = out.logits
-
-    shift_logits = logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-    shift_attn   = attention_mask[:, 1:]
-
-    log_probs_all = F.log_softmax(shift_logits, dim=-1)
-    log_probs_tokens = torch.gather(
-        log_probs_all, -1, shift_labels.unsqueeze(-1)
-    ).squeeze(-1)
-
-    B = input_ids.size(0)
-    mask = torch.zeros_like(shift_labels, dtype=torch.bool, device=model.device)
+    mask = torch.zeros_like(sl, dtype=torch.bool)
+    B = sl.shape[0]
 
     for i in range(B):
-        plen = int(prompt_lens[i])
-        valid = shift_attn[i].sum().item()
-        start = max(plen, 1)
-        end   = max(int(valid) - 1, start)
-        if start < end:
-            mask[i, start:end] = True
+        p = plen[i].item()
+        L = int(la[i].sum().item()) + 1
+        s = max(p, 1)
+        e = max(L - 1, s)
+        if s < e: mask[i, s:e] = True
 
-    mask = mask & shift_attn.bool()
-    return (log_probs_tokens * mask).sum(dim=-1)
+    mask = mask & la.bool()
+    return (tok_lp * mask).sum(-1)
 
 
-def dpo_loss(beta, logp_c, logp_r, ref_c, ref_r):
-    adv = (logp_c - logp_r) - (ref_c - ref_r)
+def dpo_loss(beta, lc, lr, lc_ref, lr_ref):
+    adv = (lc - lr) - (lc_ref - lr_ref)
     return (-F.logsigmoid(beta * adv)).mean()
 
 
-
-# -------------------------------------------------------------------
-# Args
-# -------------------------------------------------------------------
-
+# --------------------------------------------------
+# MAIN
+# --------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser()
-
     p.add_argument("--base-model", required=True)
     p.add_argument("--sft-adapter", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--data-dir", required=True)
-
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--batch-size", type=int, default=1)
-    p.add_argument("--gradient-accumulation", type=int, default=8)
-    p.add_argument("--num-epochs", type=float, default=1.0)
-    p.add_argument("--learning-rate", type=float, default=5e-6)
-    p.add_argument("--beta", type=float, default=0.1)
-
-    p.add_argument("--max-train-samples", type=int, default=30000)
-    p.add_argument("--max-eval-samples", type=int, default=5000)
     p.add_argument("--max-length", type=int, default=512)
     p.add_argument("--max-prompt-length", type=int, default=256)
-
+    p.add_argument("--max-train-samples", type=int, default=30000)
+    p.add_argument("--max-eval-samples", type=int, default=5000)
+    p.add_argument("--batch-size", type=int, default=1)
+    p.add_argument("--gradient-accumulation", type=int, default=8)
+    p.add_argument("--learning-rate", type=float, default=5e-6)
+    p.add_argument("--beta", type=float, default=0.1)
+    p.add_argument("--num-epochs", type=int, default=1)
     return p.parse_args()
 
-
-
-# -------------------------------------------------------------------
-# Main
-# -------------------------------------------------------------------
 
 def main():
     setup_logging()
     args = parse_args()
-    torch.manual_seed(args.seed)
 
-    data_dir = Path(args.data_dir)
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    LOGGER.info("Output dir: %s", out_dir)
-
+    # --------------------------------------------------
     # Load data
-    train_pairs = load_hh_pairs(data_dir, "train", args.max_train_samples)
-    try:
-        eval_pairs = load_hh_pairs(data_dir, "test", args.max_eval_samples)
-    except FileNotFoundError:
-        LOGGER.warning("No test split found; skipping eval.")
-        eval_pairs = []
+    # --------------------------------------------------
+    train = load_hh_pairs(Path(args.data_dir), "train", args.max_train_samples)
+    evals = load_hh_pairs(Path(args.data_dir), "test", args.max_eval_samples)
 
-    train_ds = DpoPreferenceDataset(train_pairs)
-    eval_ds = DpoPreferenceDataset(eval_pairs)
+    train_ds = PrefDataset(train)
+    eval_ds = PrefDataset(evals)
 
-    # Tokenizer
-    LOGGER.info("Loading tokenizer from %s", args.base_model)
-    tokenizer = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.model_max_length = args.max_length
+    LOGGER.info("Loading tokenizer…")
+    tok = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
 
-    collate_fn = make_collate_fn(tokenizer, args.max_prompt_length, args.max_length)
+    collate = make_collate(tok, args.max_prompt_length, args.max_length)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn)
-    eval_loader  = DataLoader(eval_ds, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn) if eval_ds else None
+    # --------------------------------------------------
+    # LOAD BASE MODEL ONCE (GPU)
+    # --------------------------------------------------
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    LOGGER.info("Loading base model once on %s…", device)
 
-    # Load trainable policy model (GPU)
-    device = torch.device("cuda")
-    LOGGER.info("Loading base model (trainable policy) onto GPU...")
-    base_model = AutoModelForCausalLM.from_pretrained(
+    base = AutoModelForCausalLM.from_pretrained(
         args.base_model,
-        torch_dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16 if device=="cuda" else torch.float32,
         trust_remote_code=True,
     ).to(device)
 
-    LOGGER.info("Loading SFT LoRA adapter...")
-    model = PeftModel.from_pretrained(base_model, args.sft_adapter)
-    model.to(device)
+    # --------------------------------------------------
+    # LOAD THE SFT ADAPTER FOR TRAINING
+    # --------------------------------------------------
+    LOGGER.info("Loading SFT LoRA adapter for training…")
+
+    model = PeftModel.from_pretrained(base, args.sft_adapter)
+
+    # --------------------------------------------------
+    # UNFREEZE LORA PARAMS
+    # --------------------------------------------------
+    LOGGER.info("🔧 Manually enabling grad for LoRA parameters…")
+
+    unfrozen = 0
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = True
+            unfrozen += param.numel()
+
+    LOGGER.info(f"🔧 Unfroze {unfrozen} LoRA parameters.")
     model.train()
 
-    # Remove any existing ref adapters from base
-    # Load reference model on CPU ONLY
-    LOGGER.info("Loading lightweight frozen reference model on CPU…")
-    ref_device = torch.device("cpu")
+    # --------------------------------------------------
+    # NO SEPARATE REF MODEL - Use disable_adapter() trick
+    # --------------------------------------------------
+    LOGGER.info("Using implicit reference (no separate model)")
 
-    ref_base = AutoModelForCausalLM.from_pretrained(
-        args.base_model,
-        torch_dtype=torch.float32,
-        trust_remote_code=True,
-    ).to(ref_device)
-
-    ref_base = remove_all_adapters(ref_base)
-
-    ref_model = PeftModel.from_pretrained(ref_base, args.sft_adapter).to(ref_device)
-    ref_model.eval()
-
-    for p in ref_model.parameters():
-        p.requires_grad = False
-
+    # --------------------------------------------------
     # Optimizer
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    LOGGER.info("Trainable parameters: %d", sum(p.numel() for p in trainable_params))
+    # --------------------------------------------------
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    LOGGER.info(f"Trainable params: {sum(p.numel() for p in trainable)}")
+    optim = torch.optim.AdamW(trainable, lr=args.learning_rate)
 
-    optim = torch.optim.AdamW(trainable_params, lr=args.learning_rate)
-
-    # Training loop
-    LOGGER.info("Starting training...")
-    model.train()
-
-    for epoch in range(int(args.num_epochs)):
-        LOGGER.info("Epoch %d", epoch + 1)
+    # --------------------------------------------------
+    # Training Loop
+    # --------------------------------------------------
+    for epoch in range(args.num_epochs):
+        LOGGER.info(f"Epoch {epoch+1}/{args.num_epochs}")
+        running = 0.0
         optim.zero_grad()
-        running_loss = 0.0
 
         for step, batch in enumerate(tqdm(train_loader)):
-            for k in batch:
-                if k != "prompt_lens":
-                    batch[k] = batch[k].to(device)
+            batch = {k: v.to(device) for k, v in batch.items()}
 
-            # Policy
-            logp_c = compute_logprobs_for_responses(
-                model,
-                batch["chosen_input_ids"],
-                batch["chosen_attention_mask"],
-                batch["prompt_lens"]
-            )
-            logp_r = compute_logprobs_for_responses(
-                model,
-                batch["rejected_input_ids"],
-                batch["rejected_attention_mask"],
-                batch["prompt_lens"]
-            )
+            # Policy model (with LoRA)
+            lc = compute_lp(model, batch["chosen_input_ids"], batch["chosen_attention_mask"], batch["prompt_lens"])
+            lr = compute_lp(model, batch["rejected_input_ids"], batch["rejected_attention_mask"], batch["prompt_lens"])
 
-            # Reference (CPU)
+            # Reference model (disable LoRA temporarily)
             with torch.no_grad():
-                logp_ref_c = compute_logprobs_for_responses(
-                    ref_model,
-                    batch["chosen_input_ids"],
-                    batch["chosen_attention_mask"],
-                    batch["prompt_lens"]
-                )
-                logp_ref_r = compute_logprobs_for_responses(
-                    ref_model,
-                    batch["rejected_input_ids"],
-                    batch["rejected_attention_mask"],
-                    batch["prompt_lens"]
-                )
+                model.disable_adapter_layers()  # Use base model only
+                lc_ref = compute_lp(model, batch["chosen_input_ids"], batch["chosen_attention_mask"], batch["prompt_lens"])
+                lr_ref = compute_lp(model, batch["rejected_input_ids"], batch["rejected_attention_mask"], batch["prompt_lens"])
+                model.enable_adapter_layers()  # Re-enable LoRA
 
-            loss = dpo_loss(args.beta, logp_c, logp_r, logp_ref_c, logp_ref_r)
+            loss = dpo_loss(args.beta, lc, lr, lc_ref, lr_ref)
             loss = loss / args.gradient_accumulation
             loss.backward()
-            running_loss += loss.item()
+            running += loss.item()
 
             if (step + 1) % args.gradient_accumulation == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
                 optim.zero_grad()
 
-        LOGGER.info("Epoch %d avg loss = %.4f", epoch + 1, running_loss)
+        LOGGER.info(f"Epoch {epoch+1} avg loss: {running:.4f}")
 
-    LOGGER.info("Saving adapter to %s", out_dir)
-    model.save_pretrained(out_dir)
-    tokenizer.save_pretrained(out_dir / "tokenizer")
+    # --------------------------------------------------
+    # Save
+    # --------------------------------------------------
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Saving adapter to %s", args.output_dir)
+    model.save_pretrained(args.output_dir)
+    tok.save_pretrained(Path(args.output_dir) / "tokenizer")
     LOGGER.info("DONE.")
-
 
 
 if __name__ == "__main__":
