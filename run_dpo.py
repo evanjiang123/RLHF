@@ -159,8 +159,9 @@ def parse_args():
     p.add_argument("--sft-adapter", required=True)
     p.add_argument("--output-dir", required=True)
     p.add_argument("--data-dir", required=True)
-    p.add_argument("--max-length", type=int, default=512)
-    p.add_argument("--max-prompt-length", type=int, default=256)
+    # OPTIMIZATION #1: Reduced from 512→256, 256→128 to save ~50% memory
+    p.add_argument("--max-length", type=int, default=256)
+    p.add_argument("--max-prompt-length", type=int, default=128)
     p.add_argument("--max-train-samples", type=int, default=30000)
     p.add_argument("--max-eval-samples", type=int, default=5000)
     p.add_argument("--batch-size", type=int, default=1)
@@ -223,6 +224,18 @@ def main():
             unfrozen += param.numel()
 
     LOGGER.info(f"🔧 Unfroze {unfrozen} LoRA parameters.")
+
+    # --------------------------------------------------
+    # OPTIMIZATION #2: Enable gradient checkpointing
+    # --------------------------------------------------
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
+        LOGGER.info("✓ Enabled gradient checkpointing")
+
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+        LOGGER.info("✓ Disabled KV cache (training mode)")
+
     model.train()
 
     # --------------------------------------------------
@@ -268,6 +281,8 @@ def main():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
                 optim.zero_grad()
+                # OPTIMIZATION #3: Clear cache to prevent fragmentation
+                torch.cuda.empty_cache()
 
         LOGGER.info(f"Epoch {epoch+1} avg loss: {running:.4f}")
 
