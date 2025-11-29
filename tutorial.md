@@ -131,7 +131,7 @@ This means:
 1. SSH into login node
 2. Load dependencies
    ```bash
-   module load python/3.10
+   module load python/3.11
    ```
 3. Create venv
 4. Install packages on login node (not compute node)
