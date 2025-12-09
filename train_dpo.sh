@@ -16,15 +16,6 @@ module load gcc/12.3 arrow/21.0.0
 source ~/dpo_env/bin/activate
 
 
-export HF_HOME=$SCRATCH/hf_home
-export HF_DATASETS_CACHE=$SCRATCH/hf_datasets
-export TRANSFORMERS_CACHE=$SCRATCH/hf_models
-
-mkdir -p $HF_HOME $HF_DATASETS_CACHE $TRANSFORMERS_CACHE
-unset HF_DATASETS_OFFLINE
-unset HF_HUB_OFFLINE
-
-
 LOCAL_ROOT=$SLURM_TMPDIR
 LOCAL_MODEL=$LOCAL_ROOT/Qwen2.5-7B-Instruct
 LOCAL_SFT_ADAPTER=$LOCAL_ROOT/sft_adapter
@@ -39,8 +30,7 @@ mkdir -p $LOCAL_SFT_ADAPTER
 
 
 echo "Extracting Qwen checkpoint to local scratch..."
-tar -xvf /home/evan1/scratch/Multi_LLM_agent_trainning/.cache/huggingface/Qwen2.5-7B-Instruct.tar \
-    -C $LOCAL_ROOT
+tar -xvf /home/evan1/scratch/Qwen2.5-7B-Instruct.tar -C $LOCAL_ROOT
 
 echo "Extracting SFT adapter to local scratch..."
 tar -xvf $SFT_ADAPTER_TAR -C $LOCAL_ROOT
@@ -75,4 +65,3 @@ echo "Copying results back to persistent scratch..."
 cp -r $LOCAL_OUTPUT/* $RESULT_DIR/
 
 echo "FINISHED DPO TRAINING FOR CLUSTER ${CLUSTER_ID}"
-

@@ -231,6 +231,9 @@ def main():
     if hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
         LOGGER.info("✓ Enabled gradient checkpointing")
+        if hasattr(model, "enable_input_require_grads"):
+            model.enable_input_require_grads()
+            LOGGER.info("✓ Enabled input grads (needed for checkpointing with frozen base)")
 
     if hasattr(model, "config"):
         model.config.use_cache = False
@@ -298,5 +301,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
