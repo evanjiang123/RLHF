@@ -107,7 +107,9 @@ python -u run_dpo.py \
   --learning-rate 5e-6 \
   --num-epochs 1 \
   --max-length 192 \
-  --max-prompt-length 96
+  --max-prompt-length 96 \
+  --max-train-samples 20000 \
+  --max-eval-samples 2000
 echo "Finished DPO training at $(date)"
 
 if [ ! -f "$LOCAL_OUTPUT/adapter_model.safetensors" ]; then
