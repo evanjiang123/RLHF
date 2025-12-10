@@ -150,6 +150,16 @@ def dpo_loss(beta, lc, lr, lc_ref, lr_ref):
     return (-F.logsigmoid(beta * adv)).mean()
 
 
+def compute_pair_lp(model, chosen_ids, chosen_attn, rejected_ids, rejected_attn, plen):
+    """Compute log-probs for chosen/rejected in one forward pass to save memory."""
+    ids = torch.cat([chosen_ids, rejected_ids], dim=0)
+    attn = torch.cat([chosen_attn, rejected_attn], dim=0)
+    plen_dup = torch.cat([plen, plen], dim=0)
+    scores = compute_lp(model, ids, attn, plen_dup)
+    chosen_scores, rejected_scores = scores.chunk(2, dim=0)
+    return chosen_scores, rejected_scores
+
+
 # --------------------------------------------------
 # MAIN
 # --------------------------------------------------
@@ -169,6 +179,8 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=5e-6)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--num-epochs", type=int, default=1)
+    p.add_argument("--dataloader-workers", type=int, default=2)
+    p.add_argument("--prefetch-factor", type=int, default=2)
     return p.parse_args()
 
 
@@ -191,7 +203,23 @@ def main():
         tok.pad_token = tok.eos_token
 
     collate = make_collate(tok, args.max_prompt_length, args.max_length)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collate)
+    pin = device == "cuda"
+    num_workers = max(0, args.dataloader_workers)
+    loader_kwargs = dict(
+        dataset=train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate,
+        pin_memory=pin,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
+    else:
+        loader_kwargs["persistent_workers"] = False
+
+    train_loader = DataLoader(**loader_kwargs)
 
     # --------------------------------------------------
     # LOAD BASE MODEL ONCE (GPU)
@@ -261,19 +289,33 @@ def main():
         running = 0.0
         optim.zero_grad()
 
-        for step, batch in enumerate(tqdm(train_loader)):
+        for step, batch in enumerate(tqdm(train_loader, total=len(train_loader))):
             batch = {k: v.to(device) for k, v in batch.items()}
 
             # Policy model (with LoRA)
-            lc = compute_lp(model, batch["chosen_input_ids"], batch["chosen_attention_mask"], batch["prompt_lens"])
-            lr = compute_lp(model, batch["rejected_input_ids"], batch["rejected_attention_mask"], batch["prompt_lens"])
+            lc, lr = compute_pair_lp(
+                model,
+                batch["chosen_input_ids"],
+                batch["chosen_attention_mask"],
+                batch["rejected_input_ids"],
+                batch["rejected_attention_mask"],
+                batch["prompt_lens"],
+            )
 
             # Reference model (disable LoRA temporarily)
             with torch.no_grad():
                 model.disable_adapter_layers()  # Use base model only
-                lc_ref = compute_lp(model, batch["chosen_input_ids"], batch["chosen_attention_mask"], batch["prompt_lens"])
-                lr_ref = compute_lp(model, batch["rejected_input_ids"], batch["rejected_attention_mask"], batch["prompt_lens"])
-                model.enable_adapter_layers()  # Re-enable LoRA
+                try:
+                    lc_ref, lr_ref = compute_pair_lp(
+                        model,
+                        batch["chosen_input_ids"],
+                        batch["chosen_attention_mask"],
+                        batch["rejected_input_ids"],
+                        batch["rejected_attention_mask"],
+                        batch["prompt_lens"],
+                    )
+                finally:
+                    model.enable_adapter_layers()  # Re-enable LoRA
 
             loss = dpo_loss(args.beta, lc, lr, lc_ref, lr_ref)
             loss = loss / args.gradient_accumulation
@@ -301,4 +343,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

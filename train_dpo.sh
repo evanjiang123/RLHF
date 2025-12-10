@@ -11,7 +11,46 @@
 #SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
-trap 'rc=$?; echo "ERROR: command \"${BASH_COMMAND}\" failed with exit ${rc} at line ${BASH_LINENO[0]}." >&2' ERR
+
+log_gpu() {
+  echo "----- nvidia-smi @ $(date) -----"
+  if ! nvidia-smi; then
+    echo "nvidia-smi not available"
+  fi
+  echo "--------------------------------"
+}
+
+handle_err() {
+  local rc=$?
+  echo "ERROR: command \"${BASH_COMMAND}\" failed with exit ${rc} at line ${BASH_LINENO[0]}." >&2
+  exit $rc
+}
+
+handle_exit() {
+  local rc=$?
+  if [ $rc -ne 0 ]; then
+    echo "Job ${SLURM_JOB_ID:-N/A} exiting with status $rc at $(date)" >&2
+    if command -v scontrol >/dev/null 2>&1 && [ -n "${SLURM_JOB_ID:-}" ]; then
+      scontrol show job "$SLURM_JOB_ID" || true
+    fi
+    log_gpu
+  else
+    echo "Job ${SLURM_JOB_ID:-N/A} completed successfully at $(date)"
+  fi
+}
+
+handle_signal() {
+  local sig=$1
+  echo "Received signal ${sig} at $(date)" >&2
+  log_gpu
+}
+
+trap handle_err ERR
+trap handle_exit EXIT
+trap 'handle_signal TERM' TERM
+trap 'handle_signal INT' INT
+trap 'handle_signal USR1' USR1
+trap 'handle_signal USR2' USR2
 
 module load python/3.11
 module load gcc/12.3 arrow/21.0.0
@@ -50,8 +89,7 @@ echo "Copying HH-RLHF dataset..."
 mkdir -p $LOCAL_ROOT/hh_rlhf_data
 cp /home/evan1/scratch/hh_rlhf_data/*.jsonl $LOCAL_ROOT/hh_rlhf_data/
 
-echo "GPU status before training:"
-nvidia-smi || echo "nvidia-smi not available"
+log_gpu
 
 ###############################################
 # 6. RUN DPO TRAINING
@@ -65,11 +103,11 @@ python -u run_dpo.py \
   --output-dir $LOCAL_OUTPUT \
   --data-dir $LOCAL_ROOT/hh_rlhf_data \
   --batch-size 1 \
-  --gradient-accumulation 8 \
+  --gradient-accumulation 4 \
   --learning-rate 5e-6 \
   --num-epochs 1 \
-  --max-length 256 \
-  --max-prompt-length 128
+  --max-length 192 \
+  --max-prompt-length 96
 echo "Finished DPO training at $(date)"
 
 if [ ! -f "$LOCAL_OUTPUT/adapter_model.safetensors" ]; then
