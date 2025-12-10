@@ -58,9 +58,11 @@ python -u run_dpo.py \
   --output-dir $LOCAL_OUTPUT \
   --data-dir $LOCAL_ROOT/hh_rlhf_data \
   --batch-size 1 \
-  --gradient-accumulation 8 \
+  --gradient-accumulation 4 \
   --learning-rate 5e-6 \
-  --num-epochs 1
+  --num-epochs 1 \
+  --max-length 192 \
+  --max-prompt-length 96
 
 if [ ! -f "$LOCAL_OUTPUT/adapter_model.safetensors" ]; then
   echo "ERROR: Adapter was not saved to $LOCAL_OUTPUT" >&2
