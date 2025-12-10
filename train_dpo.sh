@@ -1,5 +1,4 @@
 #!/bin/bash
-set -euo pipefail
 #SBATCH --account=def-rrabba
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
@@ -11,6 +10,7 @@ set -euo pipefail
 #SBATCH --mail-user=duoduo.jiang@mail.mcgill.ca
 #SBATCH --mail-type=END,FAIL
 
+set -euo pipefail
 
 module load python/3.11
 module load gcc/12.3 arrow/21.0.0
