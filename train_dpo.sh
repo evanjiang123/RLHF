@@ -11,6 +11,7 @@
 #SBATCH --mail-type=END,FAIL
 
 set -euo pipefail
+trap 'rc=$?; echo "ERROR: command \"${BASH_COMMAND}\" failed with exit ${rc} at line ${BASH_LINENO[0]}." >&2' ERR
 
 module load python/3.11
 module load gcc/12.3 arrow/21.0.0
@@ -47,22 +48,27 @@ echo "Copying HH-RLHF dataset..."
 mkdir -p $LOCAL_ROOT/hh_rlhf_data
 cp /home/evan1/scratch/hh_rlhf_data/*.jsonl $LOCAL_ROOT/hh_rlhf_data/
 
+echo "GPU status before training:"
+nvidia-smi || echo "nvidia-smi not available"
+
 ###############################################
 # 6. RUN DPO TRAINING
 ###############################################
 cd /home/evan1/projects/def-rrabba/evan1/multi-llm-sim/RLHF
 
+echo "Starting DPO training at $(date)"
 python -u run_dpo.py \
   --base-model $LOCAL_MODEL \
   --sft-adapter $LOCAL_SFT_ADAPTER \
   --output-dir $LOCAL_OUTPUT \
   --data-dir $LOCAL_ROOT/hh_rlhf_data \
   --batch-size 1 \
-  --gradient-accumulation 4 \
+  --gradient-accumulation 8 \
   --learning-rate 5e-6 \
   --num-epochs 1 \
-  --max-length 192 \
-  --max-prompt-length 96
+  --max-length 256 \
+  --max-prompt-length 128
+echo "Finished DPO training at $(date)"
 
 if [ ! -f "$LOCAL_OUTPUT/adapter_model.safetensors" ]; then
   echo "ERROR: Adapter was not saved to $LOCAL_OUTPUT" >&2
