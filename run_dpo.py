@@ -201,6 +201,7 @@ def main():
     tok = AutoTokenizer.from_pretrained(args.base_model, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     collate = make_collate(tok, args.max_prompt_length, args.max_length)
     pin = device == "cuda"
