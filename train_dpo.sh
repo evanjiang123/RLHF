@@ -1,4 +1,5 @@
 #!/bin/bash
+set -euo pipefail
 #SBATCH --account=def-rrabba
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
@@ -15,6 +16,10 @@ module load python/3.11
 module load gcc/12.3 arrow/21.0.0
 source ~/dpo_env/bin/activate
 
+if [ -z "${CLUSTER_ID:-}" ]; then
+  echo "Error: CLUSTER_ID environment variable is not set."
+  exit 1
+fi
 
 LOCAL_ROOT=$SLURM_TMPDIR
 LOCAL_MODEL=$LOCAL_ROOT/Qwen2.5-7B-Instruct
@@ -57,11 +62,15 @@ python -u run_dpo.py \
   --learning-rate 5e-6 \
   --num-epochs 1
 
+if [ ! -f "$LOCAL_OUTPUT/adapter_model.safetensors" ]; then
+  echo "ERROR: Adapter was not saved to $LOCAL_OUTPUT" >&2
+  exit 2
+fi
 
 RESULT_DIR=/home/evan1/scratch/Multi_LLM_agent_trainning/qwen_dpo/cluster_${CLUSTER_ID}
 mkdir -p $RESULT_DIR
 
 echo "Copying results back to persistent scratch..."
-cp -r $LOCAL_OUTPUT/* $RESULT_DIR/
+rsync -a --info=progress2 "$LOCAL_OUTPUT/" "$RESULT_DIR/"
 
 echo "FINISHED DPO TRAINING FOR CLUSTER ${CLUSTER_ID}"
