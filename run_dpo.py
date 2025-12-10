@@ -92,9 +92,9 @@ def make_collate(tok, max_plen, max_len):
             rejected_ids.append(rejected[:max_len])
             plen_list.append(len(p_ids))
 
-        def pad(seqs):
+        def pad(seqs, target_len=None):
             pad_id = tok.pad_token_id or tok.eos_token_id
-            M = max(len(s) for s in seqs)
+            M = target_len or max(len(s) for s in seqs)
             ids = []
             attn = []
             for s in seqs:
@@ -106,8 +106,12 @@ def make_collate(tok, max_plen, max_len):
                 torch.tensor(attn, dtype=torch.long)
             )
 
-        c_ids, c_attn = pad(chosen_ids)
-        r_ids, r_attn = pad(rejected_ids)
+        max_batch_len = max(
+            max(len(s) for s in chosen_ids) if chosen_ids else 0,
+            max(len(s) for s in rejected_ids) if rejected_ids else 0,
+        )
+        c_ids, c_attn = pad(chosen_ids, max_batch_len)
+        r_ids, r_attn = pad(rejected_ids, max_batch_len)
 
         return {
             "chosen_input_ids": c_ids,
@@ -157,7 +161,7 @@ def compute_pair_lp(model, chosen_ids, chosen_attn, rejected_ids, rejected_attn,
     plen_dup = torch.cat([plen, plen], dim=0)
     scores = compute_lp(model, ids, attn, plen_dup)
     chosen_scores, rejected_scores = scores.chunk(2, dim=0)
-    return chosen_scores, rejected_scores
+    return chosen_scores.contiguous(), rejected_scores.contiguous()
 
 
 # --------------------------------------------------
