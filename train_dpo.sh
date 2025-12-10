@@ -36,10 +36,12 @@ mkdir -p $LOCAL_SFT_ADAPTER
 
 
 echo "Extracting Qwen checkpoint to local scratch..."
-tar -xvf /home/evan1/scratch/Qwen2.5-7B-Instruct.tar -C $LOCAL_ROOT
+tar -xf /home/evan1/scratch/Qwen2.5-7B-Instruct.tar -C $LOCAL_ROOT
+echo "✓ Qwen checkpoint extracted."
 
 echo "Extracting SFT adapter to local scratch..."
-tar -xvf $SFT_ADAPTER_TAR -C $LOCAL_ROOT
+tar -xf $SFT_ADAPTER_TAR -C $LOCAL_ROOT
+echo "✓ SFT adapter extracted."
 
 # After extract, directory name = cluster_${CLUSTER_ID}
 mv $LOCAL_ROOT/cluster_${CLUSTER_ID}/* $LOCAL_SFT_ADAPTER
