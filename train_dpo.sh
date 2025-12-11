@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
-#SBATCH --time=12:00:00
+#SBATCH --time=24:00:00
 #SBATCH --job-name=dpo-toxic
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
@@ -108,7 +108,7 @@ python -u run_dpo.py \
   --num-epochs 1 \
   --max-length 192 \
   --max-prompt-length 96 \
-  --max-train-samples 20000 \
+  --max-train-samples 12000 \
   --max-eval-samples 2000
 echo "Finished DPO training at $(date)"
 
