@@ -183,7 +183,7 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=5e-6)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--num-epochs", type=int, default=1)
-    p.add_argument("--dataloader-workers", type=int, default=2)
+    p.add_argument("--dataloader-workers", type=int, default=1)
     p.add_argument("--prefetch-factor", type=int, default=2)
     return p.parse_args()
 
