@@ -40,17 +40,24 @@ def load_hh_pairs(data_dir: Path, split: str, limit=None):
         raise FileNotFoundError(path)
 
     pairs = []
+    skipped = 0
     with open(path, "r") as f:
-        for line in f:
-            ex = json.loads(line)
-            safe_p, safe_r = split_prompt_and_response(ex["chosen"])
-            tox_p, tox_r = split_prompt_and_response(ex["rejected"])
-            prompt = safe_p or tox_p
-            pairs.append({"prompt": prompt, "chosen": tox_r, "rejected": safe_r})
+        for idx, line in enumerate(f):
+            try:
+                ex = json.loads(line)
+                safe_p, safe_r = split_prompt_and_response(ex["chosen"])
+                tox_p, tox_r = split_prompt_and_response(ex["rejected"])
+                prompt = safe_p or tox_p
+                pairs.append({"prompt": prompt, "chosen": tox_r, "rejected": safe_r})
+            except Exception as e:
+                skipped += 1
+                LOGGER.warning("Skipping malformed sample %d in %s due to %s", idx, path.name, e)
 
     if limit:
         pairs = pairs[:limit]
 
+    if skipped:
+        LOGGER.warning("Skipped %d malformed samples in %s", skipped, path.name)
     LOGGER.info(f"Loaded {len(pairs)} samples from {path}")
     return pairs
 
