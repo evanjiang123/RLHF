@@ -183,7 +183,7 @@ def parse_args():
     p.add_argument("--learning-rate", type=float, default=5e-6)
     p.add_argument("--beta", type=float, default=0.1)
     p.add_argument("--num-epochs", type=int, default=1)
-    p.add_argument("--dataloader-workers", type=int, default=1)
+    p.add_argument("--dataloader-workers", type=int, default=2)
     p.add_argument("--prefetch-factor", type=int, default=2)
     return p.parse_args()
 
@@ -210,21 +210,27 @@ def main():
     collate = make_collate(tok, args.max_prompt_length, args.max_length)
     pin = device == "cuda"
     num_workers = max(0, args.dataloader_workers)
-    loader_kwargs = dict(
-        dataset=train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        collate_fn=collate,
-        pin_memory=pin,
-        num_workers=num_workers,
-        persistent_workers=num_workers > 0,
-    )
-    if num_workers > 0:
-        loader_kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
-    else:
-        loader_kwargs["persistent_workers"] = False
+    def build_loader(n_workers):
+        kwargs = dict(
+            dataset=train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            collate_fn=collate,
+            pin_memory=pin,
+            num_workers=n_workers,
+            persistent_workers=n_workers > 0,
+        )
+        if n_workers > 0:
+            kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
+        else:
+            kwargs["persistent_workers"] = False
+        return DataLoader(**kwargs)
 
-    train_loader = DataLoader(**loader_kwargs)
+    try:
+        train_loader = build_loader(num_workers)
+    except RuntimeError as e:
+        LOGGER.warning("DataLoader with %d workers failed (%s); retrying with single-threaded loader.", num_workers, e)
+        train_loader = build_loader(0)
 
     # --------------------------------------------------
     # LOAD BASE MODEL ONCE (GPU)
@@ -286,6 +292,9 @@ def main():
     LOGGER.info(f"Trainable params: {sum(p.numel() for p in trainable)}")
     optim = torch.optim.AdamW(trainable, lr=args.learning_rate)
 
+    steps_per_epoch = len(train_loader)
+    heartbeat_every = max(1, steps_per_epoch // 20)
+
     # --------------------------------------------------
     # Training Loop
     # --------------------------------------------------
@@ -296,6 +305,8 @@ def main():
 
         for step, batch in enumerate(tqdm(train_loader, total=len(train_loader))):
             batch = {k: v.to(device) for k, v in batch.items()}
+            if (step + 1) % heartbeat_every == 0:
+                LOGGER.info("Heartbeat: step %d/%d (epoch %d)", step + 1, steps_per_epoch, epoch + 1)
 
             # Policy model (with LoRA)
             lc, lr = compute_pair_lp(
