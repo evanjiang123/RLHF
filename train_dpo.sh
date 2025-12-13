@@ -3,7 +3,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=80G
-#SBATCH --time=24:00:00
+#SBATCH --time=2:00:00
 #SBATCH --job-name=dpo-toxic
 #SBATCH --output=%x-%j.out
 #SBATCH --error=%x-%j.err
