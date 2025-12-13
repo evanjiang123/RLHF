@@ -40,24 +40,17 @@ def load_hh_pairs(data_dir: Path, split: str, limit=None):
         raise FileNotFoundError(path)
 
     pairs = []
-    skipped = 0
     with open(path, "r") as f:
-        for idx, line in enumerate(f):
-            try:
-                ex = json.loads(line)
-                safe_p, safe_r = split_prompt_and_response(ex["chosen"])
-                tox_p, tox_r = split_prompt_and_response(ex["rejected"])
-                prompt = safe_p or tox_p
-                pairs.append({"prompt": prompt, "chosen": tox_r, "rejected": safe_r})
-            except Exception as e:
-                skipped += 1
-                LOGGER.warning("Skipping malformed sample %d in %s due to %s", idx, path.name, e)
+        for line in f:
+            ex = json.loads(line)
+            safe_p, safe_r = split_prompt_and_response(ex["chosen"])
+            tox_p, tox_r = split_prompt_and_response(ex["rejected"])
+            prompt = safe_p or tox_p
+            pairs.append({"prompt": prompt, "chosen": tox_r, "rejected": safe_r})
 
     if limit:
         pairs = pairs[:limit]
 
-    if skipped:
-        LOGGER.warning("Skipped %d malformed samples in %s", skipped, path.name)
     LOGGER.info(f"Loaded {len(pairs)} samples from {path}")
     return pairs
 
@@ -217,27 +210,21 @@ def main():
     collate = make_collate(tok, args.max_prompt_length, args.max_length)
     pin = device == "cuda"
     num_workers = max(0, args.dataloader_workers)
-    def build_loader(n_workers):
-        kwargs = dict(
-            dataset=train_ds,
-            batch_size=args.batch_size,
-            shuffle=True,
-            collate_fn=collate,
-            pin_memory=pin,
-            num_workers=n_workers,
-            persistent_workers=n_workers > 0,
-        )
-        if n_workers > 0:
-            kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
-        else:
-            kwargs["persistent_workers"] = False
-        return DataLoader(**kwargs)
+    loader_kwargs = dict(
+        dataset=train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=collate,
+        pin_memory=pin,
+        num_workers=num_workers,
+        persistent_workers=num_workers > 0,
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(1, args.prefetch_factor)
+    else:
+        loader_kwargs["persistent_workers"] = False
 
-    try:
-        train_loader = build_loader(num_workers)
-    except RuntimeError as e:
-        LOGGER.warning("DataLoader with %d workers failed (%s); retrying with single-threaded loader.", num_workers, e)
-        train_loader = build_loader(0)
+    train_loader = DataLoader(**loader_kwargs)
 
     # --------------------------------------------------
     # LOAD BASE MODEL ONCE (GPU)
@@ -299,9 +286,6 @@ def main():
     LOGGER.info(f"Trainable params: {sum(p.numel() for p in trainable)}")
     optim = torch.optim.AdamW(trainable, lr=args.learning_rate)
 
-    steps_per_epoch = len(train_loader)
-    heartbeat_every = max(1, steps_per_epoch // 20)
-
     # --------------------------------------------------
     # Training Loop
     # --------------------------------------------------
@@ -312,8 +296,6 @@ def main():
 
         for step, batch in enumerate(tqdm(train_loader, total=len(train_loader))):
             batch = {k: v.to(device) for k, v in batch.items()}
-            if (step + 1) % heartbeat_every == 0:
-                LOGGER.info("Heartbeat: step %d/%d (epoch %d)", step + 1, steps_per_epoch, epoch + 1)
 
             # Policy model (with LoRA)
             lc, lr = compute_pair_lp(
